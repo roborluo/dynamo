@@ -294,9 +294,11 @@ def parse_args() -> tuple[FrontendConfig, Optional[Namespace], Optional[Namespac
         try:
             from vllm.engine.arg_utils import AsyncEngineArgs
 
-            if Version(importlib.metadata.version("vllm")).release >= (0, 29):
+            # PATCH (vllm-dsv41-20261010): the CentML vLLM build versions itself 0.20.2rc1 (git describe from
+            # v0.20.2rc0) although its tree has the >=0.29 layout, so pick the module by import, not by version.
+            try:
                 from vllm.entrypoints.launchers.cli_args import FrontendArgs
-            else:
+            except ModuleNotFoundError:
                 from vllm.entrypoints.openai.cli_args import FrontendArgs
         except ModuleNotFoundError:
             logger.exception("Flag '--chat-processor vllm' requires vllm be installed.")
