@@ -792,6 +792,34 @@ class VllmProcessor:
             "annotations": [],
             "routing": request.get("routing"),
         }
+        # bofengl 10/11 patch: forward the agent context (X-Dynamo-Session-ID -> agent_context.session_id) so the
+        # KV router's session affinity can pin a conversation to one worker; the stock vllm processor drops it.
+        _ac = request.get("agent_context")
+        _nv = request.get("nvext")
+        if _ac is None and isinstance(_nv, dict):
+            _ac = _nv.get("agent_context")
+        if _ac is None:
+            # The Rust HTTP layer does not hand X-Dynamo-Session-ID to the Python processor (request carries no
+            # agent_context/nvext). Derive a conversation key instead: hash of the first user message, which is fixed
+            # for the whole conversation (append-only history). Same affinity semantics as a per-conversation header.
+            for _m in request.get("messages") or []:
+                if isinstance(_m, dict) and _m.get("role") == "user":
+                    _c = _m.get("content")
+                    if isinstance(_c, list):
+                        _c = "\n".join(p.get("text", "") for p in _c if isinstance(p, dict))
+                    if isinstance(_c, str) and _c:
+                        import hashlib as _hl
+                        _ac = {"session_id": "fum-" + _hl.sha1(_c.encode("utf-8", "surrogatepass")).hexdigest()[:20]}
+                    break
+        if _ac is not None:
+            dynamo_preproc["agent_context"] = _ac
+            if not getattr(self, "_bofengl_ac_logged", False):
+                self._bofengl_ac_logged = True
+                logger.warning("bofengl patch: forwarding agent_context %s", _ac)
+        elif not getattr(self, "_bofengl_noac_logged", False):
+            self._bofengl_noac_logged = True
+            logger.warning("bofengl patch: request has no agent_context; keys=%s nvext_keys=%s", sorted(request.keys()),
+                           sorted(_nv.keys()) if isinstance(_nv, dict) else None)
         if guided_decoding is not None:
             dynamo_preproc["sampling_options"]["guided_decoding"] = guided_decoding
         if reasoning_metadata.engine_reasoning_ended is not None:
