@@ -121,6 +121,71 @@ from .state_agent import state_agent_settings
 
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
+
+# ---- bofengl 10/12 patch (dep agent): conversation affinity across the local DP ranks of a DP worker -------------------
+# With VLLM_BOFENGL_DP_AFFINITY=1, a request carrying agent_context.session_id (the frontend session patch derives
+# "fum-" + sha1 of the first user message when the client sends none) is pinned to one local DP rank of this worker:
+# the first request of a session goes to the rank with the fewest sessions seen within VLLM_BOFENGL_DP_AFFINITY_TTL s
+# (default 120), later requests follow the pin. Overrides the router's dp_rank (round-robin gives None = vLLM's own DP LB,
+# which bounces a conversation's turns between ranks and loses their prefix cache). Same rule as the native API-server
+# patch (vLLM chat-serving DP affinity, VLLM_BOFENGL_DP_AFFINITY). Routing only: nothing about what is computed for a request changes.
+import os as _bofengl_os
+import time as _bofengl_time
+
+_BOFENGL_DPAFF = _bofengl_os.environ.get("VLLM_BOFENGL_DP_AFFINITY", "0") == "1"
+_BOFENGL_DPAFF_TTL = float(_bofengl_os.environ.get("VLLM_BOFENGL_DP_AFFINITY_TTL", "120"))
+_bofengl_dpaff_map: dict = {}
+_bofengl_dpaff_stats = {"n": 0, "new": 0, "nosid": 0, "logged": False}
+
+
+def _bofengl_dp_affinity(handler, request, dp_rank):
+    """Local DP rank pinned for this request's session, or dp_rank unchanged."""
+    if not _BOFENGL_DPAFF:
+        return dp_rank
+    try:
+        size = int(handler.dp_range[1])
+        if size <= 1:
+            return dp_rank
+        st = _bofengl_dpaff_stats
+        if not st["logged"]:
+            st["logged"] = True
+            logger.warning("bofengl dp-affinity: on, local dp size=%d ttl=%.0fs", size, _BOFENGL_DPAFF_TTL)
+        sid = session_id_from_request(request)
+        if sid is None:
+            st["nosid"] += 1
+            if st["nosid"] in (1, 100, 10000):
+                logger.warning("bofengl dp-affinity: %d requests without agent_context.session_id (left to the router/vLLM)",
+                               st["nosid"])
+            return dp_rank
+        now = _bofengl_time.time()
+        ent = _bofengl_dpaff_map.get(sid)
+        if ent is not None:
+            ent[1] = now
+            rank = ent[0]
+        else:
+            cnt = [0] * size
+            for r, t in _bofengl_dpaff_map.values():
+                if now - t < _BOFENGL_DPAFF_TTL and 0 <= r < size:
+                    cnt[r] += 1
+            h = int(__import__("hashlib").sha1(sid.encode()).hexdigest()[:8], 16)
+            rank = min(range(size), key=lambda r: (cnt[r], (r - h) % size))
+            _bofengl_dpaff_map[sid] = [rank, now]
+            st["new"] += 1
+            if len(_bofengl_dpaff_map) > 20000:  # drop sessions idle for over an hour
+                for k in [k for k, v in _bofengl_dpaff_map.items() if now - v[1] > 3600]:
+                    _bofengl_dpaff_map.pop(k, None)
+        st["n"] += 1
+        if st["n"] % 1000 == 0:
+            cnt = [0] * size
+            for r, t in _bofengl_dpaff_map.values():
+                if now - t < _BOFENGL_DPAFF_TTL and 0 <= r < size:
+                    cnt[r] += 1
+            logger.warning("bofengl dp-affinity: %d pinned requests (%d new sessions, %d without session id); "
+                           "active sessions per local rank %s", st["n"], st["new"], st["nosid"], cnt)
+        return rank
+    except Exception as e:  # never fail a request over routing
+        logger.warning("bofengl dp-affinity: error %r; leaving dp_rank=%s", e, dp_rank)
+        return dp_rank
 _FULL_VOCAB_LOGPROBS_SENTINEL = 2**32 - 1
 
 
@@ -3792,7 +3857,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 f"Decode request {request_id} has no LoRA specified (model: {model_name})"
             )
         routing = request.get("routing") or {}
-        dp_rank = self._to_local_dp_rank(routing.get("dp_rank"))
+        dp_rank = _bofengl_dp_affinity(self, request, self._to_local_dp_rank(routing.get("dp_rank")))
         priority = -int(routing.get("priority", 0))
 
         trace_headers = context.trace_headers()
@@ -3890,7 +3955,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         )
 
         routing = request.get("routing") or {}
-        dp_rank = self._to_local_dp_rank(routing.get("dp_rank"))
+        dp_rank = _bofengl_dp_affinity(self, request, self._to_local_dp_rank(routing.get("dp_rank")))
         priority = -int(routing.get("priority", 0))
         openai_request_id = request.get("id") or request.get("request_id", request_id)
         previous_text_per_choice: dict[int, str] = {}
@@ -4111,7 +4176,7 @@ class PrefillWorkerHandler(BaseWorkerHandler):
             )
 
         routing = request.get("routing") or {}
-        dp_rank = self._to_local_dp_rank(routing.get("dp_rank"))
+        dp_rank = _bofengl_dp_affinity(self, request, self._to_local_dp_rank(routing.get("dp_rank")))
         priority = -int(routing.get("priority", 0))
 
         trace_headers = context.trace_headers()
